@@ -1,4 +1,5 @@
 # soc
+git status
 git add .
-git commit -m "Your update message"
-git push
+git commit -m "Describe your changes"
+git push origin main
