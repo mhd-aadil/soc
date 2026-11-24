@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <array>
 #include <string>
+#include <vector>
 #include "bus.h"
 
 class FlashInterface : public sc_core::sc_module, public IBusSlave
@@ -19,7 +20,7 @@ public:
 
 
  static constexpr uint32_t FLASH_BASE_ADDR= 0x20000400;
- static constexpr uint32_t REG_SIZE= 0x14;
+ static constexpr uint32_t REG_SIZE= 0x18;
 
  static constexpr uint32_t FLASH_SIZE = 1u * 1024 * 1024;
  static constexpr uint32_t FLASH_SECTOR_SIZE = 4u * 1024;
@@ -36,6 +37,11 @@ private:
     uint32_t flash_addr = 0;
     uint32_t length = 0;
     uint32_t position = 0;
+
+    // Temporary storage for DMA data received before START.
+    std::vector<uint32_t> staging_buffer;
+    uint32_t staging_word_index = 0;
+
     uint32_t ctrl = 0;
     uint32_t status = 0;
 
@@ -49,7 +55,7 @@ private:
     void execute_operation();
     void operation_thread();
     void load_flash_image();
-    void save_flash_image();
+    bool save_flash_image();
     void erase_sector(uint32_t offset);
 };
 

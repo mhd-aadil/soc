@@ -55,50 +55,53 @@ void FlashInterface::load_flash_image()
               //as a std::streamsize.
     );
 
+    // Check whether the complete flash image was loaded.
+    if (file.gcount() != static_cast<std::streamsize>(FLASH_SIZE))
+    {
+        SC_REPORT_ERROR(
+            "FlashInterface",
+            "Flash image size is smaller than expected"
+        );
+        return;
+    }
+
     file.close();
 
 }
 
-void FlashInterface::save_flash_image()
+bool FlashInterface::save_flash_image()
 {
-    //ofstream means output file stream.
-    //It is used to write data to a file.
-    //file is the C++ object that manages writing to the file.
     std::ofstream file(
-    image_path,//This is the file path supplied to your constructor.
-    //Opens the file in binary mode.
-    std::ios::binary | std::ios::trunc
-    //trunc means truncate. It removes the existing file contents
-    //when the file is successfully opened.
+        image_path,
+        std::ios::binary | std::ios::trunc
     );
-    if (!file.is_open()) {
+
+    if (!file.is_open())
+    {
         SC_REPORT_ERROR(
             "FlashInterface",
             "Unable to open flash image for writing"
         );
-        return;
+        return false;
     }
-    //file.write(source_pointer, number_of_bytes);
+
     file.write(
         reinterpret_cast<const char*>(flash.data()),
         static_cast<std::streamsize>(FLASH_SIZE)
     );
 
-    //C++ may temporarily hold the data in a memory buffer
-    //before sending it to the file.
-    //flush() asks it to push that buffered data
-    //to the file immediately.
     file.flush();
 
-    //check if the stream has an error state, such as 
-    //a failed write or flush.
-    if (!file) {
+    if (!file)
+    {
         SC_REPORT_ERROR(
             "FlashInterface",
             "Failed to write flash image"
         );
+        return false;
     }
 
+    return true;
 }
 
 void FlashInterface::bus_access(uint32_t addr,
@@ -110,29 +113,42 @@ void FlashInterface::bus_access(uint32_t addr,
     // (void)is_write;
     switch(addr)
     {   
-        case 0x00:// FI_CTRL
-        if(is_write)
-        {
-            ctrl=data&0xfu;// Store OP bits [3:0]
-            
-            if(data&(1u<<8)) // START bit
-            {   
-                position=0;
-                transfer_complete = false;
-                status&=~0x6u;// Clear DONE and ERROR
-                operation_valid =
-                    (flash_addr <= FLASH_SIZE) &&
-                    (length <= FLASH_SIZE - flash_addr);
-                status|=1u;   // Set BUSY
+        case 0x00: // FI_CTRL
+            if (is_write)
+            {
+                // Ignore CTRL writes while an operation is active.
+                if (status & 0x01u)
+                {
+                    break;
+                }
 
-                start_event.notify(sc_core::SC_ZERO_TIME);
-            }  
-        }
-        else
-        {
-            data=ctrl;
-        }
-        break;
+                // Store OP bits [3:0].
+                // START bit [8] is not stored.
+                ctrl = data & 0x0Fu;
+
+                if (data & (1u << 8))
+                {
+                    position = 0;
+                    transfer_complete = false;
+
+                    // Clear previous DONE and ERROR flags.
+                    status &= ~0x6u;
+
+                    operation_valid =
+                        (flash_addr <= FLASH_SIZE) &&
+                        (length <= FLASH_SIZE - flash_addr);
+
+                    // Set BUSY.
+                    status |= 0x1u;
+
+                    start_event.notify(sc_core::SC_ZERO_TIME);
+                }
+            }
+            else
+            {
+                data = ctrl;
+            }
+            break;
 
         case 0x04://FI_FLASH_ADDR
         if (is_write)
@@ -144,16 +160,32 @@ void FlashInterface::bus_access(uint32_t addr,
             data=flash_addr;
         }
         break;
-        case 0x08://FI_LEN
-        if (is_write)
-        {
-            length=data;
-        }
-        else
-        {
-            data=length;
-        }
-        break;
+        case 0x08: // FI_LEN
+            if (is_write)
+            {
+                length = data;
+
+                // Calculate the number of 32-bit words required.
+                uint32_t required_words =
+                    (length / 4u) + ((length % 4u) != 0u);
+
+                // Prepare a fresh staging buffer.
+                if (length <= FLASH_SIZE)
+                {
+                    staging_buffer.assign(required_words, 0u);
+                    staging_word_index = 0;
+                }
+                else
+                {
+                    staging_buffer.clear();
+                    staging_word_index = 0;
+                }
+            }
+            else
+            {
+                data = length;
+            }
+            break;
         case 0x0c:// FI_STATUS
         if(is_write)
         {
@@ -165,85 +197,63 @@ void FlashInterface::bus_access(uint32_t addr,
         }
         break;
 
-        case 0x10:
+        case 0x10: // FI_DATA
         {
-            uint32_t op=ctrl & 0xfu;
+            uint32_t op = ctrl & 0x0Fu;
 
-            if (!operation_valid) {
-                data = 0;
-                break;
-            }
-
-            // Number of valid bytes remaining in this operation.
-            if(position>=length)
+            // PROGRAM: accept DMA data before START.
+            if (op == 0x1u && is_write)
             {
-                data=0;
-                break;
-            }
-
-            uint32_t remaining =length-position;
-            uint32_t bytes=(remaining<4u)?remaining:4u;
-
-            if(op==0x1u&&is_write)
-            {
-                
-                for(uint32_t i=0;i<bytes;i++)
+                if (staging_word_index < staging_buffer.size())
                 {
-                    uint32_t index=flash_addr+position+i;
-                    if(index<FLASH_SIZE)
-                    {
-                        uint8_t write_byte=
-                            static_cast<uint8_t>((data>>(i*0x8u))&0xffu);
-                            flash[index]&=write_byte;
-                    }
-                }
-                position+=4;
-                uint32_t required_words = (length + 3u) / 4u;
-                //The formula for rounding up integer division is:
-                //[n/d]=(n+d-1)/d
-                //for our cased=4
-                //words=(length+3)
-                uint32_t transferred_words = position / 4u;
-
-                if (transferred_words >= required_words) {
-                    transfer_complete = true;
-                    transfer_done_event.notify(sc_core::SC_ZERO_TIME);
+                    staging_buffer[staging_word_index] = data;
+                    staging_word_index++;
                 }
             }
 
-            else if (op==0x2u&& !is_write)
+            // READ: return flash data after START.
+            else if (op == 0x2u && !is_write)
             {
-                //READ: pack flash bytes into a 32-bit word.
-                data=0;
+                if (!operation_valid || position >= length)
+                {
+                    data = 0;
+                    break;
+                }
+
+                uint32_t remaining = length - position;
+                uint32_t bytes = (remaining < 4u) ? remaining : 4u;
+
+                data = 0;
 
                 for (uint32_t i = 0; i < bytes; i++)
                 {
-                    uint32_t index=flash_addr+position+i;
-                    if(index<FLASH_SIZE)
+                    uint32_t index = flash_addr + position + i;
+
+                    if (index < FLASH_SIZE)
                     {
-                        data|=static_cast<uint32_t>(flash[index])<<(i*8u);
+                        data |= static_cast<uint32_t>(flash[index])
+                                << (i * 8u);
                     }
                 }
 
-                position+=4u;
-                uint32_t required_words = (length + 3u) / 4u;
-                //The formula for rounding up integer division is:
-                //[n/d]=(n+d-1)/d
-                //for our cased=4
-                //words=(length+3)
+                position += 4u;
+
+                //uint32_t required_words = (length + 3u) / 4u;
+                uint32_t required_words =
+                    (length / 4u) + ((length % 4u) != 0u);
                 uint32_t transferred_words = position / 4u;
 
-                if (transferred_words >= required_words) {
+                if (transferred_words >= required_words)
+                {
                     transfer_complete = true;
                     transfer_done_event.notify(sc_core::SC_ZERO_TIME);
                 }
             }
-
             else
             {
-               // Unsupported access direction or operation.
-                data = 0; 
+                data = 0;
             }
+
             break;
         }
 
@@ -283,13 +293,57 @@ void FlashInterface::execute_operation()
 
     switch (op)
     {
-    case 1://PROGRAM
-        if (length > 0 && !transfer_complete) {
-            wait(transfer_done_event);
+    case 1: // PROGRAM
+    {
+        // Check whether DMA supplied all required words.
+        if (staging_word_index != staging_buffer.size())
+        {
+            status &= ~0x01u;  // Clear BUSY
+            status |= 0x04u;   // Set ERROR
+
+            fi_error_out.write(true);
+            wait(sc_core::SC_ZERO_TIME);
+            fi_error_out.write(false);
+            return;
         }
 
-        save_flash_image();
+        // Program the staged data into flash.
+        position = 0;
+
+        for (uint32_t i = 0; i < staging_buffer.size(); i++)
+        {
+            uint32_t word = staging_buffer[i];
+
+            // Process up to four bytes from this word.
+            uint32_t remaining = length - position;
+            uint32_t bytes = (remaining < 4u) ? remaining : 4u;
+
+            for (uint32_t b = 0; b < bytes; b++)
+            {
+                uint8_t write_byte =
+                    static_cast<uint8_t>((word >> (b * 8u)) & 0xFFu);
+
+                uint32_t index = flash_addr + position + b;
+
+                // Flash programming permits only 1-to-0 transitions.
+                flash[index] &= write_byte;
+            }
+
+            position += 4u;
+        }
+
+        if (!save_flash_image())
+        {
+            status &= ~0x01u;  // Clear BUSY
+            status |= 0x04u;   // Set ERROR
+
+            fi_error_out.write(true);
+            wait(sc_core::SC_ZERO_TIME);
+            fi_error_out.write(false);
+            return;
+        }
         break;
+    }
 
     case 2://read
         if(length>0 && !transfer_complete){
@@ -305,7 +359,7 @@ void FlashInterface::execute_operation()
 
         // Calculate the first sector containing the requested range.
         uint32_t first=
-            flash_addr & ~(FLASH_SECTOR_SIZE-0X1u);
+            flash_addr & ~(FLASH_SECTOR_SIZE - 1u);
 
         // Calculate the last byte of the requested range.        
         uint32_t last_byte=flash_addr + length - 1u;
@@ -314,19 +368,34 @@ void FlashInterface::execute_operation()
         uint32_t last=last_byte & ~(FLASH_SECTOR_SIZE -1u);
 
         // Erase every sector from first through last, inclusive.
-        for (uint32_t s = first; s <= last; s=s+FLASH_SECTOR_SIZE)
+       for (uint32_t s = first; s <= last; s += FLASH_SECTOR_SIZE)
         {
-            erase_sector(s);   
+            erase_sector(s);
         }
 
-        save_flash_image();
+        if (!save_flash_image())
+        {
+            status &= ~0x01u;  // Clear BUSY
+            status |= 0x04u;   // Set ERROR
 
-        break;   
+            fi_error_out.write(true);
+            wait(sc_core::SC_ZERO_TIME);
+            fi_error_out.write(false);
+            return;
+        }
+
+        break;  
     }
 
     default:
-        //Unsupported operation: do not modify flash.
-        break;
+        // Unsupported operation: reject the request.
+        status &= ~0x01u;  // Clear BUSY
+        status |= 0x04u;   // Set ERROR
+
+        fi_error_out.write(true);
+        wait(sc_core::SC_ZERO_TIME);
+        fi_error_out.write(false);
+        return;
     }
 
     // Mark the operation as finished.

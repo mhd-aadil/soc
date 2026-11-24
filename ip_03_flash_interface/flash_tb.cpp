@@ -19,6 +19,9 @@ SC_MODULE(FlashTestbench)
 
     SC_HAS_PROCESS(FlashTestbench);
 
+    bool done_pulse_detected = false;
+    bool error_pulse_detected = false;
+
     static constexpr uint32_t CTRL   = 0x20000400;
     static constexpr uint32_t ADDR   = 0x20000404;
     static constexpr uint32_t LEN    = 0x20000408;
@@ -37,6 +40,25 @@ SC_MODULE(FlashTestbench)
           fi_error("fi_error")
     {
         SC_THREAD(run_test);
+        SC_THREAD(monitor_done);
+        SC_THREAD(monitor_error);
+    }
+
+    void monitor_done()
+    {
+        while (true)
+        {
+            wait(fi_done.posedge_event());
+            done_pulse_detected = true;
+        }
+    }
+    void monitor_error()
+    {
+        while (true)
+        {
+            wait(fi_error.posedge_event());
+            error_pulse_detected = true;
+        }
     }
 
     // Wait for BUSY to clear. Fail if the operation takes too long.
@@ -211,6 +233,113 @@ SC_MODULE(FlashTestbench)
         cout << "TEST 5 PASS: 5-byte streaming transfer\n";
 
         // ------------------------------------------------
+        // TEST 5A: Two consecutive PROGRAM operations.
+        // Verify that the position and staging buffer reset.
+        // ------------------------------------------------
+
+        // Erase the sector first.
+        erase_flash(0, 8);
+
+        // First operation: program 4 bytes at address 0.
+        words[0] = 0x11223344u;
+        program_flash(0, 4, words, 1);
+
+        // Second operation: program 4 bytes at address 4.
+        words[0] = 0x55667788u;
+        program_flash(4, 4, words, 1);
+
+        // Read both locations in one operation.
+        read_flash(0, 8, words, 2);
+
+        assert(words[0] == 0x11223344u);
+        assert(words[1] == 0x55667788u);
+
+        cout << "TEST 5A PASS: Consecutive PROGRAM operations\n";
+
+        // TEST 5B: Two consecutive READ operations.
+        read_flash(0, 8, words, 2);
+        assert(words[0] == 0x11223344u);
+        assert(words[1] == 0x55667788u);
+
+        read_flash(4, 4, words, 1);
+        assert(words[0] == 0x55667788u);
+
+        cout << "TEST 5B PASS: Consecutive READ operations\n";
+
+        // TEST 5C: Reject CTRL writes while BUSY.
+
+        // Configure a 4-byte READ operation.
+        bus.write(ADDR, 0);
+        bus.write(LEN, 4);
+
+        // Start READ.
+        bus.write(CTRL, START_BIT | 2u);
+
+        // Confirm that BUSY is set.
+        uint32_t status = 0;
+        bus.read(STATUS, status);
+        assert(status & BUSY_BIT);
+
+        // Attempt to start ERASE while READ is BUSY.
+        bus.write(CTRL, START_BIT | 3u);
+
+        // CTRL must still contain READ (OP = 2).
+        uint32_t ctrl_value = 0;
+        bus.read(CTRL, ctrl_value);
+        assert(ctrl_value == 2u);
+
+        // BUSY must still be set.
+        bus.read(STATUS, status);
+        assert(status & BUSY_BIT);
+
+        // Complete the READ.
+        uint32_t read_data = 0;
+        bus.read(DATA, read_data);
+
+        assert(read_data == 0x11223344u);
+
+        // Wait for completion.
+        assert(wait_for_completion());
+
+        check_success("READ");
+
+        cout << "TEST 5C PASS: CTRL write rejected while BUSY\n";
+
+        // ------------------------------------------------
+        // TEST 5D: Verify complete multi-sector ERASE.
+        // ------------------------------------------------
+
+        // Program data at the beginning of sector 0.
+        words[0] = 0xAABBCCDDu;
+        program_flash(0x00000000u, 4, words, 1);
+
+        // Program data across the sector boundary.
+        words[0] = 0x11223344u;
+        program_flash(0x00000FFEu, 4, words, 1);
+
+        // Program data at the beginning of sector 1.
+        words[0] = 0x55667788u;
+        program_flash(0x00001000u, 4, words, 1);
+
+        // Erase 4 bytes across the boundary.
+        // Both complete sectors should be erased.
+        erase_flash(0x00000FFEu, 4);
+
+        // Verify the beginning of sector 0.
+        read_flash(0x00000000u, 4, &value, 1);
+        assert(value == 0xFFFFFFFFu);
+
+        // Verify the boundary.
+        read_flash(0x00000FFEu, 4, &value, 1);
+        assert(value == 0xFFFFFFFFu);
+
+        // Verify the beginning of sector 1.
+        read_flash(0x00001000u, 4, &value, 1);
+        assert(value == 0xFFFFFFFFu);
+
+        cout << "TEST 5D PASS: Complete multi-sector ERASE\n";
+
+        // ------------------------------------------------
         // TEST 6: W1C DONE status behavior.
         // Write 1 to DONE to clear it.
         // ------------------------------------------------
@@ -267,6 +396,260 @@ SC_MODULE(FlashTestbench)
         cout << "TEST 9 PASS: Unmapped address rejected by bus\n";
 
         // ------------------------------------------------
+        // TEST 10: Flash image persistence.
+        // ------------------------------------------------
+
+        // Program a known value.
+        words[0] = 0xA1B2C3D4u;
+        program_flash(0x00002000u, 4, words, 1);
+
+        // Read it back before stopping.
+        read_flash(0x00002000u, 4, &value, 1);
+        assert(value == 0xA1B2C3D4u);
+
+        cout << "TEST 10 PASS: Flash data programmed and saved\n";
+
+        // TEST 11: Verify flash data after simulation restart.
+        read_flash(0x00002000u, 4, &value, 1);
+
+        assert(value == 0xA1B2C3D4u);
+
+        cout << "TEST 11 PASS: Flash data persisted across restart\n";
+        
+        //TEST 12
+
+        bus.write(ADDR, 0);
+        bus.write(LEN, 4);
+        bus.write(CTRL, START_BIT | 5u);
+
+        uint32_t test12_status = wait_for_completion();
+
+        assert(test12_status & ERROR_BIT);
+        assert(!(test12_status & DONE_BIT));
+        assert(!(test12_status & BUSY_BIT));
+
+        cout << "TEST 12 PASS: Unsupported operation rejected\n";
+
+        // ------------------------------------------------
+        // TEST 13: PROGRAM and READ the last valid byte.
+        // ------------------------------------------------
+
+        erase_flash(0x000FFFFFu, 1);
+
+        words[0] = 0x0000005Au;
+        program_flash(0x000FFFFFu, 1, words, 1);
+
+        read_flash(0x000FFFFFu, 1, &value, 1);
+
+        assert((value & 0xFFu) == 0x5Au);
+
+        cout << "TEST 13 PASS: Last valid flash byte\n";
+
+        // ------------------------------------------------
+        // TEST 14: Single-sector ERASE.
+        // ------------------------------------------------
+
+        words[0] = 0x12345678u;
+        program_flash(0x00003000u, 4, words, 1);
+
+        words[0] = 0xAABBCCDDu;
+        program_flash(0x00003FFCu, 4, words, 1);
+
+        // Erase only one byte.
+        // The complete sector must be erased.
+        erase_flash(0x00003001u, 1);
+
+        // Verify beginning of sector.
+        read_flash(0x00003000u, 4, &value, 1);
+        assert(value == 0xFFFFFFFFu);
+
+        // Verify end of sector.
+        read_flash(0x00003FFCu, 4, &value, 1);
+        assert(value == 0xFFFFFFFFu);
+
+        cout << "TEST 14 PASS: Single-sector ERASE\n";
+
+        // ------------------------------------------------
+        // TEST 15: Zero-length PROGRAM and READ.
+        // ------------------------------------------------
+
+        // Zero-length PROGRAM.
+        assert(bus.write(ADDR, 0x00004000u));
+        assert(bus.write(LEN, 0));
+        assert(bus.write(CTRL, START_BIT | 1u));
+
+        uint32_t test15_status = wait_for_completion();
+
+        assert(test15_status & DONE_BIT);
+        assert(!(test15_status & ERROR_BIT));
+        assert(!(test15_status & BUSY_BIT));
+
+        // Zero-length READ.
+        assert(bus.write(ADDR, 0x00004000u));
+        assert(bus.write(LEN, 0));
+        assert(bus.write(CTRL, START_BIT | 2u));
+
+        test15_status = wait_for_completion();
+
+        assert(test15_status & DONE_BIT);
+        assert(!(test15_status & ERROR_BIT));
+        assert(!(test15_status & BUSY_BIT));
+
+        cout << "TEST 15 PASS: Zero-length PROGRAM and READ\n";
+
+        // ------------------------------------------------
+        // TEST 16: Zero-length ERASE.
+        // ------------------------------------------------
+
+        words[0] = 0x12345678u;
+        program_flash(0x00005000u, 4, words, 1);
+
+        // Request zero-length ERASE.
+        erase_flash(0x00005000u, 0);
+
+        // Verify original data remains.
+        read_flash(0x00005000u, 4, &value, 1);
+
+        assert(value == 0x12345678u);
+
+        cout << "TEST 16 PASS: Zero-length ERASE\n";
+
+        // ------------------------------------------------
+        // TEST 17: PROGRAM with insufficient staged data.
+        // ------------------------------------------------
+
+        assert(bus.write(ADDR, 0x00006000u));
+        assert(bus.write(LEN, 4));
+
+        // Start PROGRAM without writing FI_DATA.
+        assert(bus.write(CTRL, START_BIT | 1u));
+
+        uint32_t test17_status = wait_for_completion();
+
+        assert(test17_status & ERROR_BIT);
+        assert(!(test17_status & DONE_BIT));
+        assert(!(test17_status & BUSY_BIT));
+
+        cout << "TEST 17 PASS: Insufficient PROGRAM data rejected\n";
+
+        // ------------------------------------------------
+        // TEST 18: DMA-first PROGRAM sequence.
+        // ------------------------------------------------
+
+        // Start with an erased region.
+        erase_flash(0x00007000u, 4);
+
+        // Configure address and length.
+        assert(bus.write(ADDR, 0x00007000u));
+        assert(bus.write(LEN, 4));
+
+        // Configure PROGRAM OP without START.
+        assert(bus.write(CTRL, 1u));
+
+        // DMA writes data into FI_DATA before START.
+        assert(bus.write(DATA, 0xDEADBEEFu));
+
+        // Now issue PROGRAM START.
+        assert(bus.write(CTRL, START_BIT | 1u));
+
+        check_success("DMA-FIRST PROGRAM");
+
+        // Verify programmed data.
+        read_flash(0x00007000u, 4, &value, 1);
+
+        assert(value == 0xDEADBEEFu);
+
+        cout << "TEST 18 PASS: DMA-first PROGRAM sequence\n";
+
+        // ------------------------------------------------
+        // TEST 19: Extra FI_DATA accesses.
+        // ------------------------------------------------
+
+        // Program one word.
+        words[0] = 0x12345678u;
+        program_flash(0x00008000u, 4, words, 1);
+
+        // An additional PROGRAM data write must not modify flash.
+        assert(bus.write(DATA, 0xFFFFFFFFu));
+
+        // Verify flash contents.
+        read_flash(0x00008000u, 4, &value, 1);
+
+        assert(value == 0x12345678u);
+
+        // Attempt to read beyond the configured READ length.
+        assert(bus.write(ADDR, 0x00008000u));
+        assert(bus.write(LEN, 4));
+        assert(bus.write(CTRL, START_BIT | 2u));
+
+        wait(SC_ZERO_TIME);
+
+        assert(bus.read(DATA, value));
+        assert(value == 0x12345678u);
+
+        // No more valid data should remain.
+        assert(bus.read(DATA, value));
+        assert(value == 0u);
+
+        check_success("EXTRA DATA ACCESS");
+
+        cout << "TEST 19 PASS: Extra FI_DATA accesses\n";
+
+        // ------------------------------------------------
+        // TEST 20: Verify fi_done_out completion pulse.
+        // ------------------------------------------------
+
+        done_pulse_detected = false;
+
+        words[0] = 0x12345678u;
+
+        assert(bus.write(ADDR, 0x00009000u));
+        assert(bus.write(LEN, 4));
+        assert(bus.write(CTRL, START_BIT | 1u));
+
+        wait(SC_ZERO_TIME);
+
+        assert(bus.write(DATA, words[0]));
+
+        check_success("TEST 20 PROGRAM");
+
+        assert(done_pulse_detected);
+        assert(!fi_done.read());
+
+        cout << "TEST 20 PASS: fi_done_out pulse\n";
+
+        // ------------------------------------------------
+        // TEST 21: Verify fi_error_out completion pulse.
+        // ------------------------------------------------
+
+        error_pulse_detected = false;
+
+        assert(bus.write(ADDR, FlashInterface::FLASH_SIZE));
+        assert(bus.write(LEN, 4));
+        assert(bus.write(CTRL, START_BIT | 1u));
+
+        uint32_t test21_status = wait_for_completion();
+
+        assert(test21_status & ERROR_BIT);
+        assert(!(test21_status & DONE_BIT));
+        assert(!(test21_status & BUSY_BIT));
+
+        assert(error_pulse_detected);
+        assert(!fi_error.read());
+
+        cout << "TEST 21 PASS: fi_error_out pulse\n";
+
+        // TEST 22B: Verify flash persistence after restart.
+
+        words[0] = 0;
+
+        read_flash(0x2000u, 4, words, 1);
+
+        assert(words[0] == 0xA1B2C3D4u);
+
+        cout << "TEST 22B PASS: Flash data persisted after restart\n";
+
+        // ------------------------------------------------
         // Final result
         // ------------------------------------------------
         cout << "\nALL SELECTED FLASH TESTS PASSED!\n";
@@ -276,6 +659,7 @@ SC_MODULE(FlashTestbench)
         sc_stop();
     }
 };
+
 
 int sc_main(int argc, char* argv[])
 {

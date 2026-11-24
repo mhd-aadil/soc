@@ -101,7 +101,7 @@ void HostInterface::bus_access(uint32_t addr, uint32_t &data, bool is_write)
         
         else
         {
-            data= m_status_reg & 0xff;
+            data= m_status_reg & 0xf7;
         }
         break;
 
@@ -240,7 +240,7 @@ HostInterface::HostInterface(sc_core::sc_module_name name, Bus &bus):
                 }
 
             } while ((cp_status & 0x6U) == 0);
-            
+
             if ((cp_status & (0x1U<<2)) != 0)
             {
                 uint32_t cp_error_code = (cp_status >> 4) & 0xfu;
